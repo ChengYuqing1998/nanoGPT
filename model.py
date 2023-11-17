@@ -98,10 +98,12 @@ class CausalSelfAttention(nn.Module):
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and not USE_DECAY and not USE_ROTARY
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                 .view(1, 1, config.block_size, config.block_size))
             if USE_DECAY:
                 # causal mask to ensure that attention is only applied to the left in the input sequence
-                self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                     .view(1, 1, config.block_size, config.block_size))
+                # self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                #                      .view(1, 1, config.block_size, config.block_size))
                 rows = torch.arange(config.block_size).view(-1, 1)
                 cols = torch.arange(config.block_size)
                 self.register_buffer("decay",
@@ -197,7 +199,7 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            # wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = LayerNorm(config.n_embd, bias=config.bias),
@@ -228,7 +230,8 @@ class GPT(nn.Module):
         """
         n_params = sum(p.numel() for p in self.parameters())
         if non_embedding:
-            n_params -= self.transformer.wpe.weight.numel()
+            # n_params -= self.transformer.wpe.weight.numel()
+            n_params -= 0
         return n_params
 
     def _init_weights(self, module):
@@ -247,9 +250,10 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        if not USE_DECAY:
-            pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-            x = self.transformer.drop(tok_emb + pos_emb)
+        if not USE_DECAY and not USE_ROTARY and False:
+            pass
+            # pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+            # x = self.transformer.drop(tok_emb + pos_emb)
         else:
             x = self.transformer.drop(tok_emb)
         for block in self.transformer.h:
@@ -267,16 +271,16 @@ class GPT(nn.Module):
 
         return logits, loss
 
-    def crop_block_size(self, block_size):
-        # model surgery to decrease the block size if necessary
-        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
-        # but want to use a smaller block size for some smaller, simpler model
-        assert block_size <= self.config.block_size
-        self.config.block_size = block_size
-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
-        for block in self.transformer.h:
-            if hasattr(block.attn, 'bias'):
-                block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
+    # def crop_block_size(self, block_size):
+    #     # model surgery to decrease the block size if necessary
+    #     # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
+    #     # but want to use a smaller block size for some smaller, simpler model
+    #     assert block_size <= self.config.block_size
+    #     self.config.block_size = block_size
+    #     self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+    #     for block in self.transformer.h:
+    #         if hasattr(block.attn, 'bias'):
+    #             block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
 
     @classmethod
     def from_pretrained(cls, model_type, override_args=None):

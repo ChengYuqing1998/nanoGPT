@@ -115,6 +115,54 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 data_dir = os.path.join('data', dataset)
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
+
+
+def train_batch_generator():
+    data = train_data
+    data_len = len(data)
+    num_batches = int((data_len-block_size)/(batch_size*block_size))
+    start_idx = 0
+    end_idx = start_idx + batch_size * block_size
+    for b in range(num_batches):
+        if end_idx >= data_len:
+            break
+        # ix = torch.randint(len(data) - block_size, (batch_size,))
+        x = torch.stack([torch.from_numpy((data[i:i + block_size]).astype(np.int64)) for i in range(start_idx, end_idx, block_size)])
+        y = torch.stack([torch.from_numpy((data[i + 1:i + 1 + block_size]).astype(np.int64)) for i in range(start_idx, end_idx, block_size)])
+        if device_type == 'cuda':
+            x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+        else:
+            x, y = x.to(device), y.to(device)
+        start_idx = end_idx
+        end_idx = start_idx + batch_size * block_size
+        yield x, y
+
+def valid_batch_generator():
+    data = val_data
+    data_len = len(data)
+    num_batches = int((data_len - block_size) / (batch_size * block_size))
+    start_idx = 0
+    end_idx = start_idx + batch_size * block_size
+    for b in range(num_batches):
+        if end_idx >= data_len:
+            break
+        # ix = torch.randint(len(data) - block_size, (batch_size,))
+        x = torch.stack([torch.from_numpy((data[i:i + block_size]).astype(np.int64)) for i in
+                         range(start_idx, end_idx, block_size)])
+        y = torch.stack([torch.from_numpy((data[i + 1:i + 1 + block_size]).astype(np.int64)) for i in
+                         range(start_idx, end_idx, block_size)])
+        if device_type == 'cuda':
+            x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
+        else:
+            x, y = x.to(device), y.to(device)
+        start_idx = end_idx
+        end_idx = start_idx + batch_size * block_size
+        yield x, y
+
+
+
+
+
 def get_batch(split):
     data = train_data if split == 'train' else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
@@ -184,9 +232,10 @@ elif init_from.startswith('gpt2'):
     for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
         model_args[k] = getattr(model.config, k)
 # crop down the model block size if desired, using model surgery
-if block_size < model.config.block_size:
-    model.crop_block_size(block_size)
-    model_args['block_size'] = block_size # so that the checkpoint will have the right value
+assert block_size == model.config.block_size
+# if block_size < model.config.block_size:
+#     model.crop_block_size(block_size)
+#     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
@@ -209,20 +258,67 @@ if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
+# @torch.no_grad()
+# def estimate_loss():
+#     out = {}
+#     model.eval()
+#     for split in ['train', 'val']:
+#         losses = torch.zeros(eval_iters)
+#         data_gen = batch_generator(split)
+#         for k in range(eval_iters):
+#             X, Y = get_batch(split)
+#             with ctx:
+#                 logits, loss = model(X, Y)
+#             losses[k] = loss.item()
+#         out[split] = losses.mean()
+#     model.train()
+#     return out
+valid_len = len(val_data)
 @torch.no_grad()
 def estimate_loss():
     out = {}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
+        if split == "train":
+            data_gen = train_batch_generator()
+        else:
+            data_gen = valid_batch_generator()
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+
+            X, Y = next(data_gen)
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
     return out
+    # split = 'val'
+    # num_batches = int((valid_len - block_size) / batch_size)
+    # data_gen = batch_generator(split)
+    # losses = torch.zeros(num_batches)
+    # k = 0
+    # for X, Y in data_gen:
+    #     with ctx:
+    #         logits, loss = model(X, Y)
+    #     losses[k] = loss.item()
+    #     k += 1
+    # out[split] = losses.mean()
+    # model.train()
+    # return out
+
+
+    # for split in ['train', 'val']:
+    #     losses = torch.zeros(eval_iters)
+    #     data_gen = batch_generator(split)
+    #     for k in range(eval_iters):
+    #         X, Y = get_batch(split)
+    #         with ctx:
+    #             logits, loss = model(X, Y)
+    #         losses[k] = loss.item()
+    #     out[split] = losses.mean()
+    # model.train()
+    # return out
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -244,11 +340,14 @@ if wandb_log and master_process:
     wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
-X, Y = get_batch('train') # fetch the very first batch
+traindata_gen = train_batch_generator()
+# X, Y = get_batch('train') # fetch the very first batch
+X, Y = next(traindata_gen) # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+break_flag = False
 while True:
 
     # determine and set the learning rate for this iteration
@@ -260,6 +359,7 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        # print(f"step {iter_num}: val loss {losses['val']:.4f}")
         if wandb_log:
             wandb.log({
                 "iter": iter_num,
@@ -297,7 +397,13 @@ while True:
             logits, loss = model(X, Y)
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch('train')
+        # X, Y = get_batch('train')
+        try:
+            X, Y = next(traindata_gen)
+        except:
+            print("one epoch finished")
+            break_flag = True
+            break
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
     # clip the gradient
@@ -326,7 +432,7 @@ while True:
     local_iter_num += 1
 
     # termination conditions
-    if iter_num > max_iters:
+    if iter_num > max_iters or break_flag:
         break
 
 if ddp:
